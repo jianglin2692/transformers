@@ -17,9 +17,10 @@
 import ast
 import builtins
 import difflib
+import numpy as np
+import pandas as pd
 from collections.abc import Mapping
 from typing import Any, Callable, Dict, List, Optional
-
 
 class InterpreterError(ValueError):
     """
@@ -51,7 +52,7 @@ LIST_SAFE_MODULES = [
 ]
 
 PRINT_OUTPUTS, MAX_LEN_OUTPUT = "", 50000
-OPERATIONS_COUNT, MAX_OPERATIONS = 0, 1000000
+OPERATIONS_COUNT, MAX_OPERATIONS = 0, 10000000
 
 class BreakException(Exception):
     pass
@@ -407,15 +408,19 @@ def evaluate_call(call, state, tools):
 def evaluate_subscript(subscript, state, tools):
     index = evaluate_ast(subscript.slice, state, tools)
     value = evaluate_ast(subscript.value, state, tools)
-    if isinstance(index, slice):
+
+    if isinstance(value, pd.core.indexing._LocIndexer):
+        parent_object = value.obj
+        return parent_object.loc[index]
+    if isinstance(value, (pd.DataFrame, pd.Series, np.ndarray)):
+        return value[index]
+    elif isinstance(index, slice):
         return value[index]
     elif isinstance(value, (list, tuple)):
-        # Ensure the index is within bounds
         if not (-len(value) <= index < len(value)):
             raise InterpreterError(f"Index {index} out of bounds for list of length {len(value)}")
         return value[int(index)]
     elif isinstance(value, str):
-        # Ensure the index is within bounds
         if not (-len(value) <= index < len(value)):
             raise InterpreterError(f"Index {index} out of bounds for string of length {len(value)}")
         return value[index]
@@ -440,7 +445,6 @@ def evaluate_name(name, state, tools):
         return state[close_matches[0]]
     raise InterpreterError(f"The variable `{name.id}` is not defined.")
 
-
 def evaluate_condition(condition, state, tools):
     left = evaluate_ast(condition.left, state, tools)
     comparators = [evaluate_ast(c, state, tools) for c in condition.comparators]
@@ -451,33 +455,35 @@ def evaluate_condition(condition, state, tools):
 
     for op, comparator in zip(ops, comparators):
         if op == ast.Eq:
-            result = result and (current_left == comparator)
+            current_result = current_left == comparator
         elif op == ast.NotEq:
-            result = result and (current_left != comparator)
+            current_result = current_left != comparator
         elif op == ast.Lt:
-            result = result and (current_left < comparator)
+            current_result = current_left < comparator
         elif op == ast.LtE:
-            result = result and (current_left <= comparator)
+            current_result = current_left <= comparator
         elif op == ast.Gt:
-            result = result and (current_left > comparator)
+            current_result = current_left > comparator
         elif op == ast.GtE:
-            result = result and (current_left >= comparator)
+            current_result = current_left >= comparator
         elif op == ast.Is:
-            result = result and (current_left is comparator)
+            current_result = current_left is comparator
         elif op == ast.IsNot:
-            result = result and (current_left is not comparator)
+            current_result = current_left is not comparator
         elif op == ast.In:
-            result = result and (current_left in comparator)
+            current_result = current_left in comparator
         elif op == ast.NotIn:
-            result = result and (current_left not in comparator)
+            current_result = current_left not in comparator
         else:
             raise InterpreterError(f"Operator not supported: {op}")
 
+        result = result & current_result
         current_left = comparator
-        if not result:
+
+        if isinstance(result, bool) and not result:
             break
 
-    return result
+    return result if isinstance(result, (bool, pd.Series)) else result.all()
 
 
 def evaluate_if(if_statement, state, tools):
@@ -521,19 +527,24 @@ def evaluate_for(for_loop, state, tools):
 
 
 def evaluate_listcomp(listcomp, state, tools):
-    result = []
-    for generator in listcomp.generators:
-        iter_value = evaluate_ast(generator.iter, state, tools)
+    def inner_evaluate(generators, index, current_state):
+        if index >= len(generators):
+            return [evaluate_ast(listcomp.elt, current_state, tools)]
+        generator = generators[index]
+        iter_value = evaluate_ast(generator.iter, current_state, tools)
+        result = []
         for value in iter_value:
-            new_state = state.copy()
+            new_state = current_state.copy()
             if isinstance(generator.target, ast.Tuple):
                 for idx, elem in enumerate(generator.target.elts):
                     new_state[elem.id] = value[idx]
             else:
                 new_state[generator.target.id] = value
             if all(evaluate_ast(if_clause, new_state, tools) for if_clause in generator.ifs):
-                result.append(evaluate_ast(listcomp.elt, new_state, tools))
-    return result
+                result.extend(inner_evaluate(generators, index + 1, new_state))
+        return result
+
+    return inner_evaluate(listcomp.generators, 0, state)
 
 
 def evaluate_try(try_node, state, tools):
@@ -638,6 +649,23 @@ def import_modules(expression, state, authorized_imports):
             raise InterpreterError(f"Import from {expression.module} is not allowed.")
         return None
 
+def evaluate_dictcomp(dictcomp, state, tools):
+    result = {}
+    for gen in dictcomp.generators:
+        iter_value = evaluate_ast(gen.iter, state, tools)
+        for value in iter_value:
+            new_state = state.copy()
+            if isinstance(gen.target, ast.Tuple):
+                for i, elem in enumerate(gen.target.elts):
+                    new_state[elem.id] = value[i]
+            else:
+                new_state[gen.target.id] = value
+            if all(evaluate_ast(if_clause, new_state, tools) for if_clause in gen.ifs):
+                key = evaluate_ast(dictcomp.key, new_state, tools)
+                val = evaluate_ast(dictcomp.value, new_state, tools)
+                result[key] = val
+    return result
+
 
 def evaluate_ast(
     expression: ast.AST,
@@ -666,7 +694,7 @@ def evaluate_ast(
     """
     global OPERATIONS_COUNT
     if OPERATIONS_COUNT >= MAX_OPERATIONS:
-        raise InterpreterError(f"Reached {MAX_OPERATIONS} operations: this is too much, there is probably an infinite loop somewhere in the code.")
+        raise InterpreterError(f"Reached the max number of operations of {MAX_OPERATIONS}. Maybe there is an infinite loop somewhere in the code, or you're just asking too many calculations.")
     OPERATIONS_COUNT += 1
     if isinstance(expression, ast.Assign):
         # Assignement -> we evaluate the assignement which should update the state
@@ -740,8 +768,8 @@ def evaluate_ast(
         else:
             return evaluate_ast(expression.orelse, state, tools)
     elif isinstance(expression, ast.Attribute):
-        obj = evaluate_ast(expression.value, state, tools)
-        return getattr(obj, expression.attr)
+        value = evaluate_ast(expression.value, state, tools)
+        return getattr(value, expression.attr)
     elif isinstance(expression, ast.Slice):
         return slice(
             evaluate_ast(expression.lower, state, tools) if expression.lower is not None else None,
@@ -761,14 +789,7 @@ def evaluate_ast(
                     result.append(elem)
         return result
     elif isinstance(expression, ast.DictComp):
-        result = {}
-        for gen in expression.generators:
-            for container in get_iterable(evaluate_ast(gen.iter, state, tools)):
-                state[gen.target.id] = container
-                key = evaluate_ast(expression.key, state, tools)
-                value = evaluate_ast(expression.value, state, tools)
-                result[key] = value
-        return result
+        return evaluate_dictcomp(expression, state, tools)
     elif isinstance(expression, ast.While):
         return evaluate_while(expression, state, tools)
     elif isinstance(expression, (ast.Import, ast.ImportFrom)):

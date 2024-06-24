@@ -15,6 +15,7 @@
 
 import unittest
 
+import numpy as np
 import pytest
 
 from transformers import load_tool
@@ -272,6 +273,10 @@ digits[i], digits[i + 1] = digits[i + 1], digits[i]"""
         code = "x = {i: i**2 for i in range(3)}"
         result = evaluate_python_code(code, {"range": range}, state={})
         assert result == {0: 0, 1: 1, 2: 4}
+
+        code= "{num: name for num, name in {101: 'a', 102: 'b'}.items() if name not in ['a']}"
+        result = evaluate_python_code(code, {"print": print}, state={}, authorized_imports=["pandas"])
+        assert result == {102: 'b'}
 
     def test_tuple_assignment(self):
         code = "a, b = 0, 1\nb"
@@ -671,7 +676,6 @@ add_one(1, 1)
 """
         state = {}
         result = evaluate_python_code(code, {"print": print, "range": range, "ord": ord, "chr": chr}, state=state)
-        print(state)
         assert result == 2
 
         # test returning None
@@ -683,5 +687,47 @@ returns_none(1)
 """
         state = {}
         result = evaluate_python_code(code, {"print": print, "range": range, "ord": ord, "chr": chr}, state=state)
-        print(state)
         assert result is None
+
+    def test_nested_for_loop(self):
+        code="""
+all_res = []
+for i in range(10):
+    subres = []
+    for j in range(i):
+        subres.append(j)
+    all_res.append(subres)
+
+out = [i for sublist in all_res for i in sublist]
+out[:10]
+"""
+        state = {}
+        result = evaluate_python_code(code, {"print": print, "range": range}, state=state)
+        assert result  == [0, 0, 1, 0, 1, 2, 0, 1, 2, 3]
+
+    def test_pandas(self):
+        code = """
+import pandas as pd
+
+df = pd.DataFrame.from_dict({'SetCount': ['5', '4', '5'], 'Quantity': [1, 0, -1]})
+
+df['SetCount'] = pd.to_numeric(df['SetCount'], errors='coerce')
+
+parts_with_5_set_count = df[df['SetCount'] == 5.0]
+parts_with_5_set_count[['Quantity', 'SetCount']].values[1]
+"""
+        state = {}
+        result = evaluate_python_code(code, {}, state=state, authorized_imports=["pandas"])
+        assert np.array_equal(result, [-1, 5])
+
+        code = """
+import pandas as pd
+
+df = pd.DataFrame.from_dict({"AtomicNumber": [111, 104, 105], "ok": [0, 1, 2]})
+print("HH0")
+
+# Filter the DataFrame to get only the rows with outdated atomic numbers
+filtered_df = df.loc[df['AtomicNumber'].isin([104])]
+"""
+        result = evaluate_python_code(code, {"print": print}, state={}, authorized_imports=["pandas"])
+        assert np.array_equal(result.values[0], [104, 1])

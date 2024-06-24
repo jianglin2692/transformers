@@ -403,30 +403,30 @@ class Agent:
         else:
             memory = [prompt_message, task_message]
         for i, step_log in enumerate(self.logs[1:]):
-            if "llm_output" in step_log and not only_tool_calls:
+            if "llm_output" in step_log and not (summary_mode or only_tool_calls):
                 thought_message = {"role": MessageRole.ASSISTANT, "content": step_log["llm_output"]}
                 memory.append(thought_message)
             if "facts" in step_log:
-                thought_message = {"role": MessageRole.ASSISTANT, "content": step_log["facts"]}
+                thought_message = {"role": MessageRole.ASSISTANT, "content": f"[FACTS LIST]:\n" + step_log["facts"]}
                 memory.append(thought_message)
 
-            if "plan" in step_log and not summary_mode:
-                thought_message = {"role": MessageRole.ASSISTANT, "content": step_log["plan"]}
+            if "plan" in step_log and not (summary_mode or only_tool_calls):
+                thought_message = {"role": MessageRole.ASSISTANT, "content": f"[PLAN]:\n" + step_log["plan"]}
                 memory.append(thought_message)
 
-            if "tool_call" in step_log and only_tool_calls:
-                tool_call_message = {"role": MessageRole.ASSISTANT, "content": str(step_log["tool_call"])}
+            if "tool_call" in step_log and (summary_mode or only_tool_calls):
+                tool_call_message = {"role": MessageRole.ASSISTANT, "content": f"[STEP {i} TOOL CALL]: " + str(step_log["tool_call"])}
                 memory.append(tool_call_message)
 
             if "error" in step_log or "observation" in step_log:
                 if "error" in step_log:
                     message_content = (
-                        "Error: "
+                        f"[OUTPUT OF STEP {i}] Error: "
                         + str(step_log["error"])
                         + "\nNow let's retry: take care not to repeat previous errors! If you have retried several times, try a completely different approach.\n"
                     )
                 elif "observation" in step_log:
-                    message_content = f"Observation:\n{step_log['observation']}"
+                    message_content = f"[OUTPUT OF STEP {i}] Observation:\n{step_log['observation']}"
                 tool_response_message = {"role": MessageRole.TOOL_RESPONSE, "content": message_content}
                 memory.append(tool_response_message)
 
@@ -462,7 +462,7 @@ class Agent:
         This method replaces arguments with the actual values from the state if they refer to state variables.
 
         Args:
-            tool_name (`str`): Name of the Tool to execute (shoulde be one from self.toolbox).
+            tool_name (`str`): Name of the Tool to execute (should be one from self.toolbox).
             arguments (Dict[str, str]): Arguments passed to the Tool.
         """
         if tool_name not in self.toolbox.tools:
@@ -715,7 +715,7 @@ class ReactAgent(Agent):
         while final_answer is None and iteration < self.max_iterations:
             try:
                 if self.planning_interval is not None and iteration % self.planning_interval == 0:
-                    self.planning_step(task, is_first_step=(iteration == 0))
+                    self.planning_step(task, is_first_step=(iteration == 0), iteration=iteration)
                 step_logs = self.step()
                 if "final_answer" in step_logs:
                     final_answer = step_logs["final_answer"]
@@ -735,7 +735,115 @@ class ReactAgent(Agent):
 
         return final_answer
 
-    def planning_step(self, task, is_first_step=False):
+
+    def planning_step_old(self, task, is_first_step=False):
+        """
+        Plan the next steps to reach the objective.
+        """
+        if is_first_step:
+            prompt_facts = f"""Below I will present you a task. Before we begin addressing the task, please answer the following pre-survey to the best of your ability.
+
+Here is the task:
+
+{task}
+
+Here is the pre-survey:
+
+1. Please list any specific facts or figures that are GIVEN in the task itself. It is possible that there are none.
+2. Please list any facts that may need to be looked up, and WHERE SPECIFICALLY they might be found. In some cases, authoritative sources are mentioned in the request itself.
+3. Please list any facts that may need to be derived (e.g., via logical deduction, simulation, or computation)
+
+When answering this survey, keep in mind that "facts" will typically be specific names, dates, statistics, etc. Your answer should use headings:
+
+1. GIVEN FACTS
+2. FACTS TO LOOK UP
+3. FACTS TO DERIVE"""
+            message_prompt_facts = {"role": MessageRole.SYSTEM, "content": prompt_facts}
+
+            answer_facts = self.llm_engine([message_prompt_facts])
+            self.facts = answer_facts
+            message_answer_facts = {"role": MessageRole.SYSTEM, "content": f"""
+You are a world expert at task solving.
+You have been given this task to solve:
+{task}
+
+Here are some facts that you can use:
+{answer_facts}
+"""}
+
+            prompt_plan = f"""Great.
+Now you will have access to the following tools:
+{self._toolbox.show_tool_descriptions(self.tool_description_template)}.
+
+For the given task, develop a step-by-step plan taking into account the above inputs and list of facts. Rely on available tools.
+This plan should involve individual tasks, that if executed correctly will yield the correct answer. 
+Do not skip steps, do not add any superfluous steps.
+Stop at the final step of the plan, do not try to go into execution phase yet!
+Now begin!"""
+            message_prompt_plan = {"role": MessageRole.USER, "content": prompt_plan}
+            answer_plan = self.llm_engine([message_answer_facts, message_prompt_plan])
+
+            final_plan_redaction = f"""Here are the facts that I deduced from the instructions:
+{answer_facts}
+
+Here is the plan of action that I will follow to solve the task:
+{answer_plan}"""
+            self.logs.append({"plan": final_plan_redaction})
+            self.progressing = True
+        else:  # update plan
+            agent_memory = self.write_inner_memory_from_logs(summary_mode=True) # This will not log the plan but will log facts
+
+            facts_update_message = {
+                "role": MessageRole.USER,
+                "content": """Earlier you've built a list of facts.
+But now may have learned useful new facts or invalidated some false ones. Please update your list of facts based on the previous history:
+1. GIVEN OR LEARNED FACTS
+2. FACTS STILL TO LOOK UP
+3. FACTS STILL TO DERIVE
+
+New list of facts:
+""",
+            }
+            facts_update = self.llm_engine(agent_memory + [facts_update_message])
+            self.logs.append(
+                {"facts": f"""Here is the list of facts that I know, that I just updated based on previous history:
+{facts_update}"""})
+
+            plan_update_message = {
+                "role": MessageRole.USER,
+                "content": f"""
+You're still working towards solving the following task:
+{task}
+
+And you can use these tools:
+{self._toolbox.show_tool_descriptions(self.tool_description_template)}.
+
+Here is the up to date list of facts that you know:
+{facts_update}
+
+Now for the given task, develop a step-by-step plan taking into account the above inputs and list of facts. Rely on available tools.
+This plan should involve individual tasks, that if executed correctly will yield the correct answer. 
+Do not skip steps, do not add any superfluous steps.
+Stop at the final step of the plan, do not try to go into execution phase yet!
+Now begin!
+""",
+            }
+            plan_update = self.llm_engine(agent_memory + [plan_update_message])
+            
+            self.logs.append(
+                {"plan": f"""I still need to solve the task:
+"
+{task}
+"
+Here is my new/updated plan of action:
+{plan_update}
+"""
+                }
+            )
+            print("UPDATED PLAN", self.logs[-1]["plan"])
+
+
+    def planning_step(self, task, is_first_step=False, iteration: int = None):
         """
         Plan the next steps to reach the objective.
         """
@@ -743,26 +851,25 @@ class ReactAgent(Agent):
             prompt_facts = f"""Below I will present you a task. You will now build a comprehensive preparatory survey of which facts we have at our disposal and which ones we still need
 
 Here is the task:
-
+```
 {task}
-
+```
 Now extract information relevant for the task and identify things that must be discovered in order to successfully complete the task.
 Don't make any assumptions. For each item, provide a thorough reasoning. Here is how you will structure this survey:
 
 ---
-### 1. Facts that we know
-List here the specific facts that you already have access to (there might be nothing here).
+### 1. Facts given in the task
+List here the specific facts given in the task that could help you (there might be nothing here).
 
 ### 2. Facts to look up
 List here any facts that we may need to look up.
 Also list where to find each of these, for instance a website, a file... - maybe the task contains some sources that you should re-use here.
 
 ### 3. Facts to derive
-List here anything that we want to derive from the above.
-
+List here anything that we want to derive from the above by logical reasoning, for instance computation or simulation.
 
 Keep in mind that "facts" will typically be specific names, dates, values, etc. Your answer should use the below headings:
-### 1. Facts that we know
+### 1. Facts given in the task
 ### 2. Facts to look up
 ### 3. Facts to derive
 Do not add anything else.
@@ -775,51 +882,41 @@ Now begin!"""
 
             prompt_plan = f"""You are a world expert at making efficient plans to solve any task using a set of carefully crafted tools.
 
-For the given task, develop a step-by-step plan taking into account the given task and list of facts.
-This plan should involve individual tasks, that if executed correctly will yield the correct answer. 
-Do not skip steps, do not add any superfluous steps.
-Stop at the final step of the plan, do not try to go into execution phase yet!
-
-Plan:
-### 1. Collect all relevant information
-- Collect information on the package from the web
-- Relevant tools: [web_search]
-
-### 2. Compute results
-- Multiply the obtained integer by the distance
-
-### 3. Sanity check
-- Verify that the answer makes sense
-- Relevant tools: [web_search]
-
-### 4. Return answer
-- If the result makes sense, return it
-- Relevant tools: [final_answer]
-
+Now for the given task, develop a step-by-step high-level plan taking into account the above inputs and list of facts.
+This plan should involve individual tasks based on the avilable tools, that if executed correctly will yield the correct answer. 
+Do not skip steps, do not add any superfluous steps. Only write the high-level plan, DO NOT DETAIL INDIVIDUAL TOOL CALLS.
+After writing the final step of the plan, write the '\n<end_plan>' tag and stop there.
 """
             prompt_plan_user = f"""
 Here is your task:
 
 Task:
+```
 {task}
+```
 
-Your plan should leverage this toolbox:
+Your plan can leverage any of these tools:
 {self._toolbox.show_tool_descriptions(self.tool_description_template)}
 
 List of facts that you know:
+```
 {answer_facts}
+```
 
 Now begin! Write your plan below:
 """
             message_prompt_plan = {"role": MessageRole.SYSTEM, "content": prompt_plan}
             message_prompt_plan_user = {"role": MessageRole.USER, "content": prompt_plan_user}
-            answer_plan = self.llm_engine([message_prompt_plan, message_prompt_plan_user])
+            answer_plan = self.llm_engine([message_prompt_plan, message_prompt_plan_user], stop_sequences=['<end_plan>'])
 
-            final_plan_redaction = f"""[PLANNING STEP]
-Here is the plan of action that I will follow to solve the task:
-{answer_plan}"""
+            final_plan_redaction = f"""Here is the plan of action that I will follow to solve the task:
+```
+{answer_plan}
+```"""
             final_facts_redaction = f"""Here are the facts that I know so far:
-{answer_facts}"""
+```
+{answer_facts}
+```"""
             self.logs.append({"plan": final_plan_redaction, "facts": final_facts_redaction})
             self.progressing = True
             print("PLAN:\n", final_plan_redaction)
@@ -829,72 +926,67 @@ Here is the plan of action that I will follow to solve the task:
             facts_update_message = {
                 "role": MessageRole.USER,
                 "content": """Earlier we've built a list of facts.
-But now you may have learned useful new facts or invalidated some false ones.
+But since in your previous steps you may have learned useful new facts or invalidated some false ones.
 Please update your list of facts based on the previous history, and provide these headings:
-### 1. Facts that we know from the initial task
+### 1. Facts given in the task
 ### 2. Facts that we have learned
 ### 3. Facts still to look up
 ### 4. Facts still to derive
 
-New list of facts:
-""",
+Now write your new list of facts below.""",
             }
             facts_update = self.llm_engine(agent_memory + [facts_update_message])
             plan_update_message = {
                 "role": MessageRole.SYSTEM,
                 "content": f"""You are a world expert at making efficient plans to solve any task using a set of carefully crafted tools.
 
-For the given task, I want you develop a step-by-step plan taking into account the given task and list of facts. Rely on available tools.
-This plan should involve individual tasks, that if executed correctly will yield the correct answer. 
-Do not skip steps, do not add any superfluous steps.
-Stop at the final step of the plan, do not try to go into execution phase yet!
+You have been given a task:
+```
+{task}
+```
 
----
-Example:
-
-Plan:
-### 1. Collect all relevant information
-- Collect information on the package from the web
-- Relevant tools: [web_search]
-
-### 2. Compute results
-- Multiply the obtained integer by the distance
-
-### 3. Sanity check
-- Verify that the answer makes sense
-- Relevant tools: [web_search]
-
-### 4. Return answer
-- If the result makes sense, return it
-- Relevant tools: [final_answer]
----
-
-Find below the record of the task to solve and what has been tried to solve it.
+Find below the record of what has been tried so far to solve it. Then you will be asked to make an updated plan to solve the task.
+If the previous tries so far have met some success, you can make an updated plan based on these actions.
+If you are stalled, you can make a completely new plan starting from scratch.
 """,
             }
             plan_update_message_user = {
                 "role": MessageRole.USER,
                 "content": f"""
-You're still working towards solving this  task:
+You're still working towards solving this task:
+```
 {task}
+```
 
 You have access to these tools:
 {self._toolbox.show_tool_descriptions(self.tool_description_template)}
 
 Here is the up to date list of facts that you know:
+```
 {facts_update}
+```
+
+Now for the given task, develop a step-by-step high-level plan taking into account the above inputs and list of facts.
+This plan should involve individual tasks based on the avilable tools, that if executed correctly will yield the correct answer. 
+Do not skip steps, do not add any superfluous steps. Only write the high-level plan, DO NOT DETAIL INDIVIDUAL TOOL CALLS.
+After writing the final step of the plan, write the '\n<end_plan>' tag and stop there.
 
 Now write your new plan below."""}
-            plan_update = self.llm_engine([plan_update_message] + agent_memory + [plan_update_message_user])
-            final_plan_redaction = f"""[PLANNING STEP]
-I still need to solve the task:
+            plan_update = self.llm_engine([plan_update_message] + agent_memory + [plan_update_message_user], stop_sequences=['<end_plan>'])
+            final_plan_redaction = f"""I still need to solve the task I was given:
+```
 {task}
+```
 
-Here is my new/updated plan of action:
+Here is my new/updated plan of action to solve the task:
+```
 {plan_update}
+```
 """
             final_facts_redaction = f"""Here is the updated list of the facts that I know:
-{facts_update}"""
+```
+{facts_update}
+```"""
             self.logs.append(
                 {"plan": final_plan_redaction, "facts": final_facts_redaction}
             )
